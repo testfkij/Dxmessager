@@ -10,7 +10,7 @@ bcrypt==4.0.1
 cryptography==41.0.3
 pyOpenSSL==23.2.0
 python-socketio==5.9.0
-python-engineio==4.5.1
+python-engineio==4.9.1
 eventlet==0.33.3
 PyMySQL==1.1.0
 mysqlclient==2.2.0
