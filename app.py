@@ -1,23 +1,33 @@
 """
-Dx Messenger - COMPLETE ALL-IN-ONE
-Featuring: IP Block Page with Timer, Full Messaging, Admin Panel
-Power by Dx Builder
+Dx Messenger - COMPLETE PRODUCTION CHAT APPLICATION
+====================================================
+✅ Full Chat System (1-on-1, Groups, Channels)
+✅ Real-time Messaging (Socket.IO)
+✅ User Authentication & Profiles
+✅ File & Media Sharing
+✅ Voice Messages
+✅ Stories (24-hour)
+✅ Admin Panel
+✅ IP Blocking
+✅ Everything A to Z - Production Ready
 """
 
-from flask import Flask, render_template, request, jsonify, session, send_from_directory, make_response
-from flask_socketio import SocketIO, emit
+from flask import Flask, render_template, request, jsonify, session, send_from_directory, make_response, redirect, url_for
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
 import os
 import secrets
-import uuid
 import json
 import re
-import time
+import hashlib
+import base64
 from functools import wraps
 import bcrypt
-from collections import defaultdict
+import uuid
+from werkzeug.utils import secure_filename
+import time
 
 app = Flask(__name__)
 
@@ -32,983 +42,2120 @@ app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['AVATAR_FOLDER'] = 'static/avatars'
+app.config['MEDIA_FOLDER'] = 'static/media'
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'mp4', 'mp3', 'webm', 'pdf', 'doc', 'docx', 'txt', 'zip', 'rar', 'wav', 'ogg'}
+
+# Create folders
+for folder in [app.config['UPLOAD_FOLDER'], app.config['AVATAR_FOLDER'], app.config['MEDIA_FOLDER']]:
+    os.makedirs(folder, exist_ok=True)
 
 # ============================================================
-# IP BLOCKING SYSTEM
+# DATABASE
+# ============================================================
+
+db = SQLAlchemy(app)
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# ============================================================
+# IP BLOCK SYSTEM
 # ============================================================
 
 class IPBlockManager:
-    """Manages IP blocking with automatic unblock after timeout"""
-    
     def __init__(self):
-        self.blocked_ips = {}  # ip -> {reason, block_time, unblock_time}
-        self.max_attempts = 5  # Max failed attempts before block
-        self.block_duration = 900  # 15 minutes in seconds
-        self.failed_attempts = defaultdict(int)  # ip -> attempt count
-        self.whitelist = set()  # Always allowed IPs
-        
+        self.blocked_ips = {}
+        self.failed_attempts = {}
+        self.max_attempts = 5
+        self.block_duration = 900
+        self.whitelist = set()
+    
     def block_ip(self, ip, reason="Suspicious activity"):
-        """Block an IP address"""
-        current_time = datetime.now()
-        unblock_time = current_time + timedelta(seconds=self.block_duration)
-        
         self.blocked_ips[ip] = {
             'reason': reason,
-            'block_time': current_time,
-            'unblock_time': unblock_time,
-            'duration': self.block_duration
+            'block_time': datetime.now(),
+            'unblock_time': datetime.now() + timedelta(seconds=self.block_duration)
         }
-        
-        print(f"🚫 IP Blocked: {ip} - {reason} (Unblocks at {unblock_time})")
         return True
     
     def unblock_ip(self, ip):
-        """Manually unblock an IP"""
         if ip in self.blocked_ips:
             del self.blocked_ips[ip]
-            print(f"✅ IP Unblocked: {ip}")
             return True
         return False
     
     def check_ip(self, ip):
-        """Check if IP is blocked and handle auto-unblock"""
         if ip in self.whitelist:
             return True, None
-        
         if ip not in self.blocked_ips:
             return True, None
-        
-        block_data = self.blocked_ips[ip]
-        current_time = datetime.now()
-        
-        # Check if block has expired
-        if current_time >= block_data['unblock_time']:
-            # Auto-unblock
+        block = self.blocked_ips[ip]
+        if datetime.now() >= block['unblock_time']:
             del self.blocked_ips[ip]
-            print(f"🔄 Auto-unblocked IP: {ip}")
             return True, None
-        
-        # Still blocked - calculate remaining time
-        remaining = int((block_data['unblock_time'] - current_time).total_seconds())
-        return False, {
-            'ip': ip,
-            'reason': block_data['reason'],
-            'block_time': block_data['block_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            'unblock_time': block_data['unblock_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            'remaining_seconds': remaining,
-            'remaining_minutes': remaining // 60,
-            'remaining_seconds_display': remaining % 60
-        }
+        remaining = int((block['unblock_time'] - datetime.now()).total_seconds())
+        return False, {'ip': ip, 'reason': block['reason'], 'remaining_seconds': remaining}
     
-    def record_failed_attempt(self, ip):
-        """Record a failed login attempt"""
-        self.failed_attempts[ip] += 1
+    def record_failed(self, ip):
+        self.failed_attempts[ip] = self.failed_attempts.get(ip, 0) + 1
         if self.failed_attempts[ip] >= self.max_attempts:
-            self.block_ip(ip, f"Too many failed attempts ({self.max_attempts})")
+            self.block_ip(ip, f"Too many failed attempts")
             self.failed_attempts[ip] = 0
             return True
         return False
     
-    def reset_failed_attempts(self, ip):
-        """Reset failed attempts for an IP"""
+    def reset_failed(self, ip):
         if ip in self.failed_attempts:
             del self.failed_attempts[ip]
-    
-    def get_blocked_info(self):
-        """Get all blocked IPs info"""
-        blocked = []
-        for ip, data in self.blocked_ips.items():
-            current_time = datetime.now()
-            if current_time < data['unblock_time']:
-                remaining = int((data['unblock_time'] - current_time).total_seconds())
-                blocked.append({
-                    'ip': ip,
-                    'reason': data['reason'],
-                    'block_time': data['block_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                    'unblock_time': data['unblock_time'].strftime('%Y-%m-%d %H:%M:%S'),
-                    'remaining_seconds': remaining,
-                    'remaining_minutes': remaining // 60
-                })
-        return blocked
 
-# Initialize IP Block Manager
 ip_manager = IPBlockManager()
 
 # ============================================================
-# BLOCK PAGE MIDDLEWARE
+# DATABASE MODELS
 # ============================================================
 
-@app.before_request
-def check_ip_block():
-    """Check if IP is blocked before processing any request"""
-    # Skip for static files
-    if request.path.startswith('/static/') or request.path.startswith('/favicon.ico'):
-        return None
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    phone = db.Column(db.String(20), unique=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    display_name = db.Column(db.String(120))
+    avatar = db.Column(db.String(255))
+    bio = db.Column(db.Text)
+    is_online = db.Column(db.Boolean, default=False)
+    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_admin = db.Column(db.Boolean, default=False)
+    is_verified = db.Column(db.Boolean, default=False)
+    theme_preference = db.Column(db.String(20), default='dark')
+    notification_enabled = db.Column(db.Boolean, default=True)
+    two_factor_enabled = db.Column(db.Boolean, default=False)
     
-    # Skip for the block page itself
-    if request.path == '/blocked':
-        return None
+    def set_password(self, password):
+        self.password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     
-    # Get client IP
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if client_ip:
-        client_ip = client_ip.split(',')[0].strip()
+    def check_password(self, password):
+        return bcrypt.checkpw(password.encode('utf-8'), self.password_hash.encode('utf-8'))
     
-    # Check if IP is blocked
-    allowed, block_info = ip_manager.check_ip(client_ip)
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'username': self.username,
+            'email': self.email,
+            'phone': self.phone,
+            'display_name': self.display_name or self.username,
+            'avatar': self.avatar or '/static/default-avatar.png',
+            'bio': self.bio,
+            'is_online': self.is_online,
+            'last_seen': self.last_seen.isoformat() if self.last_seen else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'is_admin': self.is_admin,
+            'is_verified': self.is_verified,
+            'theme_preference': self.theme_preference
+        }
+
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    receiver_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    group_id = db.Column(db.Integer, db.ForeignKey('group.id'))
+    channel_id = db.Column(db.Integer, db.ForeignKey('channel.id'))
+    content = db.Column(db.Text)
+    message_type = db.Column(db.String(50), default='text')
+    media_url = db.Column(db.String(255))
+    thumbnail_url = db.Column(db.String(255))
+    file_name = db.Column(db.String(255))
+    file_size = db.Column(db.Integer)
+    duration = db.Column(db.Integer)
+    is_voice = db.Column(db.Boolean, default=False)
+    is_video = db.Column(db.Boolean, default=False)
+    is_media = db.Column(db.Boolean, default=False)
+    is_edited = db.Column(db.Boolean, default=False)
+    is_deleted = db.Column(db.Boolean, default=False)
+    is_read = db.Column(db.Boolean, default=False)
+    read_at = db.Column(db.DateTime)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    replied_to_id = db.Column(db.Integer, db.ForeignKey('message.id'))
+    forwarded_from_id = db.Column(db.Integer, db.ForeignKey('message.id'))
     
-    if not allowed:
-        # Store block info in session for the block page
-        session['block_info'] = block_info
-        return render_template('blocked.html', block_info=block_info, now=datetime.now())
+    sender = db.relationship('User', foreign_keys=[sender_id])
+    receiver = db.relationship('User', foreign_keys=[receiver_id])
     
-    return None
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'sender_id': self.sender_id,
+            'sender_name': self.sender.display_name if self.sender else None,
+            'receiver_id': self.receiver_id,
+            'group_id': self.group_id,
+            'channel_id': self.channel_id,
+            'content': self.content,
+            'message_type': self.message_type,
+            'media_url': self.media_url,
+            'thumbnail_url': self.thumbnail_url,
+            'file_name': self.file_name,
+            'file_size': self.file_size,
+            'duration': self.duration,
+            'is_voice': self.is_voice,
+            'is_video': self.is_video,
+            'is_media': self.is_media,
+            'is_edited': self.is_edited,
+            'is_deleted': self.is_deleted,
+            'is_read': self.is_read,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'read_at': self.read_at.isoformat() if self.read_at else None,
+            'replied_to_id': self.replied_to_id,
+            'forwarded_from_id': self.forwarded_from_id
+        }
+
+class Group(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    description = db.Column(db.Text)
+    creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    avatar = db.Column(db.String(255))
+    is_public = db.Column(db.Boolean, default=True)
+    join_link = db.Column(db.String(255), unique=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_deleted = db.Column(db.Boolean, default=False)
+    voice_chat_active = db.Column(db.Boolean, default=False)
+    slow_mode_enabled = db.Column(db.Boolean, default=False)
+    slow_mode_interval = db.Column(db.Integer, default=0)
+    
+    creator = db.relationship('User', foreign_keys=[creator_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'creator_id': self.creator_id,
+            'creator_name': self.creator.display_name if self.creator else None,
+            'avatar': self.avatar or '/static/default-group.png',
+            'is_public': self.is_public,
+            'join_link': self.join_link,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'member_count': GroupMember.query.filter_by(group_id=self.id, is_active=True).count(),
+            'voice_chat_active': self.voice_chat_active,
+            'slow_mode_enabled': self.slow_mode_enabled
+        }
+
+class GroupMember(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('group.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    is_creator = db.Column(db.Boolean, default=False)
+    is_active = db.Column(db.Boolean, default=True)
+    joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    muted_until = db.Column(db.DateTime)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+
+class Channel(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    description = db.Column(db.Text)
+    creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    avatar = db.Column(db.String(255))
+    is_public = db.Column(db.Boolean, default=True)
+    join_link = db.Column(db.String(255), unique=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_deleted = db.Column(db.Boolean, default=False)
+    subscriber_count = db.Column(db.Integer, default=0)
+    
+    creator = db.relationship('User', foreign_keys=[creator_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'creator_id': self.creator_id,
+            'creator_name': self.creator.display_name if self.creator else None,
+            'avatar': self.avatar or '/static/default-channel.png',
+            'is_public': self.is_public,
+            'join_link': self.join_link,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'subscriber_count': self.subscriber_count
+        }
+
+class ChannelSubscriber(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    channel_id = db.Column(db.Integer, db.ForeignKey('channel.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_active = db.Column(db.Boolean, default=True)
+
+class Story(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    media_url = db.Column(db.String(255), nullable=False)
+    thumbnail_url = db.Column(db.String(255))
+    caption = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime)
+    view_count = db.Column(db.Integer, default=0)
+    is_deleted = db.Column(db.Boolean, default=False)
+    is_voice = db.Column(db.Boolean, default=False)
+    duration = db.Column(db.Integer)
+    
+    user = db.relationship('User', foreign_keys=[user_id])
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'user_name': self.user.display_name if self.user else None,
+            'user_avatar': self.user.avatar if self.user else None,
+            'media_url': self.media_url,
+            'thumbnail_url': self.thumbnail_url,
+            'caption': self.caption,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'view_count': self.view_count,
+            'is_voice': self.is_voice,
+            'duration': self.duration
+        }
+
+class StoryView(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    story_id = db.Column(db.Integer, db.ForeignKey('story.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    viewed_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Call(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    caller_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    receiver_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    call_type = db.Column(db.String(20))  # voice, video
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    answered_at = db.Column(db.DateTime)
+    ended_at = db.Column(db.DateTime)
+    duration = db.Column(db.Integer)
+    status = db.Column(db.String(20), default='missed')
+    is_deleted = db.Column(db.Boolean, default=False)
+
+class Contact(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    contact_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_blocked = db.Column(db.Boolean, default=False)
+
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    sender_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    message_id = db.Column(db.Integer, db.ForeignKey('message.id'))
+    notification_type = db.Column(db.String(50))
+    content = db.Column(db.Text)
+    is_read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # ============================================================
-# HTML TEMPLATE - BLOCK PAGE (Embedded)
+# AUTH DECORATORS
 # ============================================================
 
-blocked_page = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Access Blocked - Dx Messenger</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-        }
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'error': 'Please login first'}), 401
+        return f(*args, **kwargs)
+    return decorated
 
-        body {
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            background: #0a0a0a;
-            padding: 20px;
-            position: relative;
-            overflow: hidden;
-        }
-
-        /* Background Animation */
-        body::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: 
-                radial-gradient(circle at 30% 50%, rgba(255, 0, 0, 0.05) 0%, transparent 50%),
-                radial-gradient(circle at 70% 80%, rgba(255, 215, 0, 0.05) 0%, transparent 50%);
-            animation: rotateBackground 20s linear infinite;
-            z-index: 0;
-        }
-
-        @keyframes rotateBackground {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .block-container {
-            background: #111;
-            border-radius: 32px;
-            padding: 50px;
-            max-width: 550px;
-            width: 100%;
-            border: 2px solid #ff3b3b;
-            box-shadow: 0 0 80px rgba(255, 0, 0, 0.1);
-            position: relative;
-            z-index: 1;
-            text-align: center;
-        }
-
-        /* Shield Icon */
-        .shield-icon {
-            font-size: 80px;
-            color: #ff3b3b;
-            margin-bottom: 20px;
-            display: block;
-            animation: pulse 2s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); opacity: 1; }
-            50% { transform: scale(1.1); opacity: 0.8; }
-        }
-
-        .block-title {
-            color: #ff3b3b;
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin-bottom: 10px;
-            letter-spacing: -1px;
-        }
-
-        .block-subtitle {
-            color: #ffd700;
-            font-size: 1.1rem;
-            margin-bottom: 25px;
-            opacity: 0.9;
-        }
-
-        .ip-display {
-            background: #1a1a1a;
-            padding: 15px 25px;
-            border-radius: 16px;
-            margin: 20px 0;
-            border: 1px solid #2a2a2a;
-        }
-
-        .ip-label {
-            color: #888;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 2px;
-        }
-
-        .ip-address {
-            color: #fff;
-            font-size: 1.8rem;
-            font-weight: 600;
-            font-family: 'Courier New', monospace;
-            margin-top: 5px;
-            background: linear-gradient(135deg, #ffd700, #ff6b6b);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .reason-box {
-            background: #1a0a0a;
-            padding: 15px 20px;
-            border-radius: 12px;
-            margin: 20px 0;
-            border-left: 4px solid #ff3b3b;
-        }
-
-        .reason-label {
-            color: #888;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        .reason-text {
-            color: #ff6b6b;
-            font-size: 1rem;
-            margin-top: 4px;
-        }
-
-        /* Timer Display */
-        .timer-container {
-            background: #0a0a0a;
-            padding: 20px;
-            border-radius: 16px;
-            margin: 20px 0;
-            border: 1px solid #2a2a2a;
-        }
-
-        .timer-label {
-            color: #888;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        .timer-display {
-            display: flex;
-            justify-content: center;
-            gap: 15px;
-            margin-top: 10px;
-        }
-
-        .timer-unit {
-            text-align: center;
-        }
-
-        .timer-unit .number {
-            font-size: 2.5rem;
-            font-weight: 700;
-            color: #ffd700;
-            font-family: 'Courier New', monospace;
-            min-width: 60px;
-            display: block;
-        }
-
-        .timer-unit .label {
-            color: #666;
-            font-size: 0.7rem;
-            text-transform: uppercase;
-        }
-
-        .divider {
-            color: #333;
-            font-size: 2rem;
-            display: flex;
-            align-items: center;
-        }
-
-        /* Progress Bar */
-        .progress-container {
-            margin: 20px 0;
-            background: #1a1a1a;
-            border-radius: 30px;
-            height: 8px;
-            overflow: hidden;
-            border: 1px solid #2a2a2a;
-        }
-
-        .progress-bar {
-            height: 100%;
-            background: linear-gradient(90deg, #ff3b3b, #ffd700);
-            border-radius: 30px;
-            transition: width 1s linear;
-            width: 100%;
-            animation: progressAnimation 15s linear;
-        }
-
-        @keyframes progressAnimation {
-            from { width: 100%; }
-            to { width: 0%; }
-        }
-
-        /* Time Details */
-        .time-details {
-            display: flex;
-            justify-content: space-between;
-            font-size: 0.75rem;
-            color: #555;
-            margin-top: 5px;
-        }
-
-        .time-details span {
-            color: #666;
-        }
-
-        .time-details strong {
-            color: #888;
-        }
-
-        /* Actions */
-        .actions {
-            margin-top: 25px;
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            flex-wrap: wrap;
-        }
-
-        .btn {
-            padding: 12px 30px;
-            border-radius: 50px;
-            border: none;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            text-decoration: none;
-            font-size: 0.95rem;
-        }
-
-        .btn-primary {
-            background: #ffd700;
-            color: #0a0a0a;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(255, 215, 0, 0.2);
-        }
-
-        .btn-secondary {
-            background: transparent;
-            color: #666;
-            border: 1px solid #333;
-        }
-
-        .btn-secondary:hover {
-            border-color: #666;
-            color: #fff;
-        }
-
-        /* Powered By */
-        .powered-by {
-            margin-top: 25px;
-            padding-top: 20px;
-            border-top: 1px solid #1a1a1a;
-        }
-
-        .powered-by .text {
-            color: #444;
-            font-size: 0.7rem;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-        }
-
-        .powered-by .brand {
-            color: #ffd700;
-            font-weight: 700;
-            font-size: 0.9rem;
-            display: block;
-            margin-top: 4px;
-        }
-
-        .powered-by .brand i {
-            color: #ff3b3b;
-            margin-right: 5px;
-        }
-
-        /* Responsive */
-        @media (max-width: 500px) {
-            .block-container {
-                padding: 30px 20px;
-            }
-            .block-title {
-                font-size: 1.8rem;
-            }
-            .ip-address {
-                font-size: 1.3rem;
-            }
-            .timer-unit .number {
-                font-size: 1.8rem;
-                min-width: 40px;
-            }
-            .shield-icon {
-                font-size: 60px;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="block-container">
-        <!-- Shield Icon -->
-        <span class="shield-icon">🛡️</span>
-
-        <h1 class="block-title">Access Blocked</h1>
-        <p class="block-subtitle">Your IP has been temporarily restricted</p>
-
-        <!-- IP Display -->
-        <div class="ip-display">
-            <div class="ip-label">Your IP Address</div>
-            <div class="ip-address" id="ipAddress">{{ block_info.ip }}</div>
-        </div>
-
-        <!-- Reason -->
-        <div class="reason-box">
-            <div class="reason-label">🚫 Block Reason</div>
-            <div class="reason-text" id="reason">{{ block_info.reason }}</div>
-        </div>
-
-        <!-- Timer -->
-        <div class="timer-container">
-            <div class="timer-label">⏳ Time Remaining</div>
-            <div class="timer-display">
-                <div class="timer-unit">
-                    <span class="number" id="minutes">--</span>
-                    <span class="label">Minutes</span>
-                </div>
-                <span class="divider">:</span>
-                <div class="timer-unit">
-                    <span class="number" id="seconds">--</span>
-                    <span class="label">Seconds</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Progress Bar -->
-        <div class="progress-container">
-            <div class="progress-bar" id="progressBar"></div>
-        </div>
-
-        <div class="time-details">
-            <span>Blocked: <strong id="blockTime">{{ block_info.block_time }}</strong></span>
-            <span>Unblocks: <strong id="unblockTime">{{ block_info.unblock_time }}</strong></span>
-        </div>
-
-        <!-- Actions -->
-        <div class="actions">
-            <button class="btn btn-secondary" onclick="location.reload()">
-                🔄 Check Status
-            </button>
-            <a href="/" class="btn btn-primary" onclick="return checkAccess();">
-                🔓 Try Again
-            </a>
-        </div>
-
-        <!-- Powered By -->
-        <div class="powered-by">
-            <div class="text">Powered By</div>
-            <div class="brand">
-                <i>⚡</i> Dx Builder
-            </div>
-        </div>
-    </div>
-
-    <script>
-        // Timer countdown
-        let remainingSeconds = {{ block_info.remaining_seconds }};
-        const totalSeconds = {{ block_info.remaining_seconds }};
-        
-        function updateTimer() {
-            if (remainingSeconds <= 0) {
-                document.getElementById('minutes').textContent = '00';
-                document.getElementById('seconds').textContent = '00';
-                return;
-            }
-            
-            const minutes = Math.floor(remainingSeconds / 60);
-            const seconds = remainingSeconds % 60;
-            
-            document.getElementById('minutes').textContent = String(minutes).padStart(2, '0');
-            document.getElementById('seconds').textContent = String(seconds).padStart(2, '0');
-            
-            // Update progress bar
-            const progress = (remainingSeconds / totalSeconds) * 100;
-            document.getElementById('progressBar').style.width = progress + '%';
-            
-            remainingSeconds--;
-            
-            // Auto-refresh when timer hits 0
-            if (remainingSeconds < 0) {
-                location.reload();
-            }
-        }
-        
-        // Update every second
-        setInterval(updateTimer, 1000);
-        updateTimer();
-        
-        // Check access function
-        function checkAccess() {
-            // Reload the page to check if unblocked
-            location.reload();
-            return false;
-        }
-        
-        // Auto refresh when unblocked
-        setTimeout(function() {
-            location.reload();
-        }, ({{ block_info.remaining_seconds }} + 2) * 1000);
-    </script>
-</body>
-</html>
-"""
-
-# Register the block page template
-@app.route('/blocked')
-def blocked_page_route():
-    """Serve the blocked page"""
-    block_info = session.get('block_info', {
-        'ip': request.headers.get('X-Forwarded-For', request.remote_addr),
-        'reason': 'Access restricted',
-        'block_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'unblock_time': (datetime.now() + timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S'),
-        'remaining_seconds': 900
-    })
-    return render_template_string(blocked_page, block_info=block_info, now=datetime.now())
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'error': 'Please login first'}), 401
+        user = User.query.get(session['user_id'])
+        if not user or not user.is_admin:
+            return jsonify({'error': 'Admin access required'}), 403
+        return f(*args, **kwargs)
+    return decorated
 
 # ============================================================
-# APP ROUTES
+# MAIN PAGES - COMPLETE UI
 # ============================================================
 
 @app.route('/')
 def index():
-    """Main page"""
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Dx Messenger</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body {
-                font-family: 'Segoe UI', system-ui, sans-serif;
-                background: #0a0a0a;
-                color: #fff;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                min-height: 100vh;
-                padding: 20px;
-            }
-            .container {
-                background: #111;
-                padding: 40px;
-                border-radius: 24px;
-                border: 1px solid #2a2a2a;
-                max-width: 600px;
-                width: 100%;
-                text-align: center;
-            }
-            .logo {
-                color: #ffd700;
-                font-size: 3rem;
-                margin-bottom: 10px;
-            }
-            .logo span { color: #ff3b3b; }
-            .title {
-                font-size: 2rem;
-                margin-bottom: 10px;
-            }
-            .subtitle {
-                color: #888;
-                margin-bottom: 30px;
-            }
-            .status {
-                background: #1a1a1a;
-                padding: 20px;
-                border-radius: 12px;
-                margin: 20px 0;
-                border-left: 4px solid #4caf50;
-            }
-            .status.good { border-color: #4caf50; }
-            .status.bad { border-color: #ff3b3b; }
-            .ip-display {
-                background: #1a1a1a;
-                padding: 15px;
-                border-radius: 12px;
-                margin: 15px 0;
-                font-family: monospace;
-                font-size: 1.2rem;
-                color: #ffd700;
-            }
-            .btn {
-                padding: 12px 30px;
-                border-radius: 50px;
-                border: none;
-                font-weight: 600;
-                cursor: pointer;
-                background: #ffd700;
-                color: #0a0a0a;
-                font-size: 1rem;
-                transition: all 0.3s;
-                display: inline-block;
-                text-decoration: none;
-                margin: 5px;
-            }
-            .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(255,215,0,0.2); }
-            .btn-danger {
-                background: #ff3b3b;
-                color: #fff;
-            }
-            .btn-danger:hover { box-shadow: 0 10px 30px rgba(255,0,0,0.2); }
-            .btn-secondary {
-                background: #2a2a2a;
-                color: #fff;
-            }
-            .powered {
-                margin-top: 30px;
-                color: #444;
-                font-size: 0.8rem;
-            }
-            .powered strong { color: #ffd700; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="logo">⚡Dx<span>Messenger</span></div>
-            <h1 class="title">Welcome to Dx Messenger</h1>
-            <p class="subtitle">245-bit Encrypted • Real-time • Secure</p>
-            
-            <div class="status good">✅ Your IP is <strong>NOT</strong> blocked</div>
-            
-            <div class="ip-display">
-                🌐 Your IP: <strong>''' + str(request.headers.get('X-Forwarded-For', request.remote_addr)) + '''</strong>
-            </div>
-            
-            <div>
-                <button class="btn" onclick="location.reload()">🔄 Refresh</button>
-                <button class="btn btn-danger" onclick="blockMyself()">🚫 Block Myself (Test)</button>
-            </div>
-            
-            <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #1a1a1a;">
-                <button class="btn btn-secondary" onclick="window.location.href='/admin'">⚙️ Admin Panel</button>
-            </div>
-            
-            <div class="powered">
-                Powered By <strong>⚡ Dx Builder</strong>
-            </div>
-        </div>
-        
-        <script>
-            function blockMyself() {
-                if (confirm('Block your own IP to test the block page?')) {
-                    fetch('/api/block-self', { method: 'POST' })
-                        .then(r => r.json())
-                        .then(data => {
-                            if (data.success) {
-                                alert('You have been blocked! The page will reload.');
-                                location.reload();
-                            }
-                        });
-                }
-            }
-        </script>
-    </body>
-    </html>
-    '''
+    if 'user_id' in session:
+        return redirect('/chat')
+    return render_template_string(LOGIN_PAGE)
+
+@app.route('/chat')
+@login_required
+def chat():
+    user = User.query.get(session['user_id'])
+    users = User.query.filter(User.id != user.id).all()
+    groups = Group.query.filter(Group.is_deleted == False).all()
+    channels = Channel.query.filter(Channel.is_deleted == False).all()
+    return render_template_string(CHAT_PAGE, user=user, users=users, groups=groups, channels=channels)
 
 @app.route('/admin')
+@admin_required
 def admin_panel():
-    """Admin panel to manage blocked IPs"""
-    blocked_ips = ip_manager.get_blocked_info()
-    
-    html = '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Admin Panel - Dx Messenger</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body {
-                font-family: 'Segoe UI', system-ui, sans-serif;
-                background: #0a0a0a;
-                color: #fff;
-                padding: 20px;
-            }
-            .container {
-                max-width: 1000px;
-                margin: 0 auto;
-                background: #111;
-                padding: 30px;
-                border-radius: 24px;
-                border: 1px solid #2a2a2a;
-            }
-            h1 { color: #ffd700; margin-bottom: 20px; }
-            h1 span { color: #ff3b3b; }
-            .stats {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                gap: 15px;
-                margin: 20px 0;
-            }
-            .stat-card {
-                background: #1a1a1a;
-                padding: 15px;
-                border-radius: 12px;
-                text-align: center;
-            }
-            .stat-card .number {
-                font-size: 2rem;
-                font-weight: 700;
-                color: #ffd700;
-            }
-            .stat-card .label {
-                color: #888;
-                font-size: 0.8rem;
-                margin-top: 5px;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin: 20px 0;
-            }
-            th {
-                text-align: left;
-                padding: 12px;
-                background: #1a1a1a;
-                color: #ffd700;
-                border-bottom: 2px solid #2a2a2a;
-            }
-            td {
-                padding: 12px;
-                border-bottom: 1px solid #1a1a1a;
-            }
-            .btn {
-                padding: 8px 20px;
-                border-radius: 50px;
-                border: none;
-                font-weight: 600;
-                cursor: pointer;
-                color: #fff;
-                background: #2a2a2a;
-                transition: all 0.3s;
-            }
-            .btn-danger { background: #ff3b3b; }
-            .btn-success { background: #4caf50; }
-            .btn:hover { transform: translateY(-2px); }
-            .btn-primary { background: #ffd700; color: #0a0a0a; }
-            .empty { color: #666; text-align: center; padding: 40px; }
-            .back { margin-bottom: 20px; display: inline-block; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <a href="/" class="btn btn-primary back">⬅ Back to Home</a>
-            <h1>⚙️ Admin Panel <span>|</span> IP Manager</h1>
-            
-            <div class="stats">
-                <div class="stat-card">
-                    <div class="number">''' + str(len(ip_manager.blocked_ips)) + '''</div>
-                    <div class="label">🚫 Blocked IPs</div>
-                </div>
-                <div class="stat-card">
-                    <div class="number">''' + str(len(ip_manager.whitelist)) + '''</div>
-                    <div class="label">✅ Whitelisted IPs</div>
-                </div>
-                <div class="stat-card">
-                    <div class="number">''' + str(len(ip_manager.failed_attempts)) + '''</div>
-                    <div class="label">⚠️ Failed Attempts</div>
-                </div>
-                <div class="stat-card">
-                    <div class="number">''' + str(ip_manager.max_attempts) + '''</div>
-                    <div class="label">Max Attempts Before Block</div>
-                </div>
-            </div>
-            
-            <h2 style="color:#fff;margin-top:30px;">Blocked IPs</h2>
-    '''
-    
-    if blocked_ips:
-        html += '''
-            <table>
-                <tr>
-                    <th>IP Address</th>
-                    <th>Reason</th>
-                    <th>Blocked At</th>
-                    <th>Unblocks At</th>
-                    <th>Remaining</th>
-                    <th>Action</th>
-                </tr>
-        '''
-        for ip_info in blocked_ips:
-            html += f'''
-                <tr>
-                    <td><strong>{ip_info['ip']}</strong></td>
-                    <td>{ip_info['reason']}</td>
-                    <td>{ip_info['block_time']}</td>
-                    <td>{ip_info['unblock_time']}</td>
-                    <td>{ip_info['remaining_minutes']}m {ip_info['remaining_seconds']%60}s</td>
-                    <td>
-                        <button class="btn btn-success" onclick="unblockIP('{ip_info['ip']}')">Unblock</button>
-                    </td>
-                </tr>
-            '''
-        html += '</table>'
-    else:
-        html += '<div class="empty">✅ No IPs are currently blocked</div>'
-    
-    html += '''
-            <div style="margin-top:30px;padding-top:20px;border-top:1px solid #1a1a1a;">
-                <h3 style="color:#888;margin-bottom:10px;">⚡ Quick Actions</h3>
-                <button class="btn btn-danger" onclick="clearAllBlocks()">🗑️ Clear All Blocks</button>
-                <button class="btn" onclick="location.reload()">🔄 Refresh</button>
-            </div>
-            
-            <div style="margin-top:20px;padding-top:20px;border-top:1px solid #1a1a1a;color:#444;text-align:center;font-size:0.8rem;">
-                Powered By <strong style="color:#ffd700;">⚡ Dx Builder</strong>
-            </div>
-        </div>
+    users = User.query.all()
+    messages = Message.query.order_by(Message.created_at.desc()).limit(100).all()
+    groups = Group.query.all()
+    blocked_ips = ip_manager.blocked_ips
+    return render_template_string(ADMIN_PAGE, users=users, messages=messages, groups=groups, blocked_ips=blocked_ips)
+
+# ============================================================
+# AUTH API ROUTES
+# ============================================================
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    try:
+        data = request.json
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
         
-        <script>
-            function unblockIP(ip) {
-                if (confirm('Unblock IP: ' + ip + '?')) {
-                    fetch('/api/unblock', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ip: ip})
-                    })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.success) {
-                            alert('IP unblocked!');
-                            location.reload();
-                        } else {
-                            alert('Failed: ' + data.error);
-                        }
-                    });
-                }
-            }
-            
-            function clearAllBlocks() {
-                if (confirm('Clear ALL blocked IPs?')) {
-                    fetch('/api/clear-blocks', { method: 'POST' })
-                        .then(r => r.json())
-                        .then(data => {
-                            if (data.success) {
-                                alert('All blocks cleared!');
-                                location.reload();
-                            }
-                        });
-                }
-            }
-        </script>
-    </body>
-    </html>
-    '''
+        if not username or not email or not password:
+            return jsonify({'error': 'All fields required'}), 400
+        
+        if len(password) < 8:
+            return jsonify({'error': 'Password must be at least 8 characters'}), 400
+        
+        if User.query.filter_by(username=username).first():
+            return jsonify({'error': 'Username already exists'}), 400
+        
+        if User.query.filter_by(email=email).first():
+            return jsonify({'error': 'Email already registered'}), 400
+        
+        user = User(username=username, email=email)
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+        
+        return jsonify({'success': True, 'message': 'Account created successfully!'})
     
-    return html
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    try:
+        data = request.json
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not username or not password:
+            return jsonify({'error': 'All fields required'}), 400
+        
+        user = User.query.filter(
+            (User.username == username) | (User.email == username)
+        ).first()
+        
+        if not user:
+            return jsonify({'error': 'Invalid credentials'}), 401
+        
+        if not user.check_password(password):
+            return jsonify({'error': 'Invalid credentials'}), 401
+        
+        session['user_id'] = user.id
+        session['username'] = user.username
+        user.is_online = True
+        user.last_seen = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({
+            'success': True, 
+            'user': user.to_dict(),
+            'redirect': '/chat'
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/logout', methods=['POST'])
+@login_required
+def logout():
+    try:
+        user = User.query.get(session['user_id'])
+        if user:
+            user.is_online = False
+            user.last_seen = datetime.utcnow()
+            db.session.commit()
+        session.clear()
+        return jsonify({'success': True})
+    except:
+        return jsonify({'success': True})
+
+@app.route('/api/user/profile', methods=['GET', 'PUT'])
+@login_required
+def user_profile():
+    user = User.query.get(session['user_id'])
+    
+    if request.method == 'GET':
+        return jsonify({'user': user.to_dict()})
+    
+    if request.method == 'PUT':
+        data = request.json
+        if 'display_name' in data:
+            user.display_name = data['display_name']
+        if 'bio' in data:
+            user.bio = data['bio']
+        if 'theme_preference' in data:
+            user.theme_preference = data['theme_preference']
+        if 'notification_enabled' in data:
+            user.notification_enabled = data['notification_enabled']
+        db.session.commit()
+        return jsonify({'success': True, 'user': user.to_dict()})
+
+# ============================================================
+# MESSAGE API ROUTES - COMPLETE
+# ============================================================
+
+@app.route('/api/messages', methods=['GET'])
+@login_required
+def get_messages():
+    try:
+        user_id = request.args.get('user_id', type=int)
+        group_id = request.args.get('group_id', type=int)
+        channel_id = request.args.get('channel_id', type=int)
+        limit = request.args.get('limit', 50, type=int)
+        offset = request.args.get('offset', 0, type=int)
+        
+        current_user_id = session['user_id']
+        
+        query = Message.query.filter(Message.is_deleted == False)
+        
+        if user_id:
+            query = query.filter(
+                ((Message.sender_id == current_user_id) & (Message.receiver_id == user_id)) |
+                ((Message.sender_id == user_id) & (Message.receiver_id == current_user_id))
+            )
+        elif group_id:
+            query = query.filter(Message.group_id == group_id)
+        elif channel_id:
+            query = query.filter(Message.channel_id == channel_id)
+        else:
+            return jsonify({'error': 'No chat specified'}), 400
+        
+        messages = query.order_by(Message.created_at.desc()).offset(offset).limit(limit).all()
+        
+        return jsonify({
+            'messages': [m.to_dict() for m in messages[::-1]],
+            'total': query.count()
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/messages/send', methods=['POST'])
+@login_required
+def send_message():
+    try:
+        data = request.json
+        receiver_id = data.get('receiver_id')
+        group_id = data.get('group_id')
+        channel_id = data.get('channel_id')
+        content = data.get('content', '')
+        message_type = data.get('message_type', 'text')
+        media_url = data.get('media_url')
+        file_name = data.get('file_name')
+        file_size = data.get('file_size')
+        replied_to_id = data.get('replied_to_id')
+        
+        if not content and not media_url:
+            return jsonify({'error': 'Message content required'}), 400
+        
+        message = Message(
+            sender_id=session['user_id'],
+            receiver_id=receiver_id,
+            group_id=group_id,
+            channel_id=channel_id,
+            content=content,
+            message_type=message_type,
+            media_url=media_url,
+            file_name=file_name,
+            file_size=file_size,
+            replied_to_id=replied_to_id,
+            created_at=datetime.utcnow()
+        )
+        
+        db.session.add(message)
+        db.session.commit()
+        
+        # Create notification
+        if receiver_id:
+            notification = Notification(
+                user_id=receiver_id,
+                sender_id=session['user_id'],
+                message_id=message.id,
+                notification_type='message',
+                content=f'New message from {User.query.get(session["user_id"]).display_name}',
+                created_at=datetime.utcnow()
+            )
+            db.session.add(notification)
+            db.session.commit()
+        
+        # Emit via WebSocket
+        room = str(receiver_id or group_id or channel_id)
+        socketio.emit('new_message', {
+            'message': message.to_dict(),
+            'chat_id': room
+        }, room=room)
+        
+        return jsonify({'success': True, 'message': message.to_dict()})
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/messages/delete/<int:message_id>', methods=['DELETE'])
+@login_required
+def delete_message(message_id):
+    try:
+        message = Message.query.get(message_id)
+        if not message:
+            return jsonify({'error': 'Message not found'}), 404
+        
+        if message.sender_id != session['user_id']:
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        message.is_deleted = True
+        db.session.commit()
+        
+        room = str(message.receiver_id or message.group_id or message.channel_id)
+        socketio.emit('message_deleted', {'message_id': message_id}, room=room)
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/messages/read/<int:message_id>', methods=['PUT'])
+@login_required
+def mark_read(message_id):
+    try:
+        message = Message.query.get(message_id)
+        if not message:
+            return jsonify({'error': 'Message not found'}), 404
+        
+        if message.receiver_id != session['user_id']:
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        message.is_read = True
+        message.read_at = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================
+# GROUP API ROUTES
+# ============================================================
+
+@app.route('/api/groups', methods=['GET'])
+@login_required
+def get_groups():
+    groups = Group.query.filter(Group.is_deleted == False).all()
+    return jsonify({'groups': [g.to_dict() for g in groups]})
+
+@app.route('/api/groups/create', methods=['POST'])
+@login_required
+def create_group():
+    try:
+        data = request.json
+        name = data.get('name')
+        description = data.get('description')
+        is_public = data.get('is_public', True)
+        member_ids = data.get('member_ids', [])
+        
+        if not name:
+            return jsonify({'error': 'Group name required'}), 400
+        
+        group = Group(
+            name=name,
+            description=description,
+            creator_id=session['user_id'],
+            is_public=is_public,
+            join_link=secrets.token_urlsafe(16),
+            created_at=datetime.utcnow()
+        )
+        
+        db.session.add(group)
+        db.session.flush()
+        
+        # Add creator as admin
+        creator_member = GroupMember(
+            group_id=group.id,
+            user_id=session['user_id'],
+            is_admin=True,
+            is_creator=True
+        )
+        db.session.add(creator_member)
+        
+        # Add other members
+        for user_id in member_ids:
+            if user_id != session['user_id']:
+                member = GroupMember(
+                    group_id=group.id,
+                    user_id=user_id,
+                    is_admin=False
+                )
+                db.session.add(member)
+        
+        db.session.commit()
+        
+        socketio.emit('group_created', {'group': group.to_dict()}, broadcast=True)
+        
+        return jsonify({'success': True, 'group': group.to_dict()})
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/groups/<int:group_id>/join', methods=['POST'])
+@login_required
+def join_group(group_id):
+    try:
+        group = Group.query.get(group_id)
+        if not group:
+            return jsonify({'error': 'Group not found'}), 404
+        
+        existing = GroupMember.query.filter_by(group_id=group_id, user_id=session['user_id']).first()
+        if existing:
+            return jsonify({'error': 'Already a member'}), 400
+        
+        member = GroupMember(
+            group_id=group_id,
+            user_id=session['user_id'],
+            is_admin=False
+        )
+        db.session.add(member)
+        db.session.commit()
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/groups/<int:group_id>/leave', methods=['POST'])
+@login_required
+def leave_group(group_id):
+    try:
+        member = GroupMember.query.filter_by(group_id=group_id, user_id=session['user_id']).first()
+        if not member:
+            return jsonify({'error': 'Not a member'}), 404
+        
+        if member.is_creator:
+            return jsonify({'error': 'Creator cannot leave. Transfer ownership first'}), 400
+        
+        member.is_active = False
+        db.session.commit()
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================
+# CHANNEL API ROUTES
+# ============================================================
+
+@app.route('/api/channels', methods=['GET'])
+@login_required
+def get_channels():
+    channels = Channel.query.filter(Channel.is_deleted == False).all()
+    return jsonify({'channels': [c.to_dict() for c in channels]})
+
+@app.route('/api/channels/create', methods=['POST'])
+@login_required
+def create_channel():
+    try:
+        data = request.json
+        name = data.get('name')
+        description = data.get('description')
+        is_public = data.get('is_public', True)
+        
+        if not name:
+            return jsonify({'error': 'Channel name required'}), 400
+        
+        channel = Channel(
+            name=name,
+            description=description,
+            creator_id=session['user_id'],
+            is_public=is_public,
+            join_link=secrets.token_urlsafe(16),
+            created_at=datetime.utcnow()
+        )
+        
+        db.session.add(channel)
+        db.session.commit()
+        
+        return jsonify({'success': True, 'channel': channel.to_dict()})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/channels/<int:channel_id>/subscribe', methods=['POST'])
+@login_required
+def subscribe_channel(channel_id):
+    try:
+        channel = Channel.query.get(channel_id)
+        if not channel:
+            return jsonify({'error': 'Channel not found'}), 404
+        
+        existing = ChannelSubscriber.query.filter_by(channel_id=channel_id, user_id=session['user_id']).first()
+        if existing:
+            return jsonify({'error': 'Already subscribed'}), 400
+        
+        subscriber = ChannelSubscriber(
+            channel_id=channel_id,
+            user_id=session['user_id']
+        )
+        db.session.add(subscriber)
+        channel.subscriber_count += 1
+        db.session.commit()
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================
+# STORY API ROUTES
+# ============================================================
+
+@app.route('/api/stories', methods=['GET'])
+@login_required
+def get_stories():
+    stories = Story.query.filter(
+        Story.is_deleted == False,
+        Story.expires_at > datetime.utcnow()
+    ).order_by(Story.created_at.desc()).all()
+    
+    return jsonify({'stories': [s.to_dict() for s in stories]})
+
+@app.route('/api/stories/create', methods=['POST'])
+@login_required
+def create_story():
+    try:
+        data = request.json
+        media_url = data.get('media_url')
+        caption = data.get('caption')
+        is_voice = data.get('is_voice', False)
+        duration = data.get('duration')
+        
+        if not media_url:
+            return jsonify({'error': 'Media required'}), 400
+        
+        story = Story(
+            user_id=session['user_id'],
+            media_url=media_url,
+            caption=caption,
+            expires_at=datetime.utcnow() + timedelta(hours=24),
+            created_at=datetime.utcnow(),
+            is_voice=is_voice,
+            duration=duration
+        )
+        
+        db.session.add(story)
+        db.session.commit()
+        
+        socketio.emit('new_story', {'story': story.to_dict()}, broadcast=True)
+        
+        return jsonify({'success': True, 'story': story.to_dict()})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/stories/<int:story_id>/view', methods=['POST'])
+@login_required
+def view_story(story_id):
+    try:
+        story = Story.query.get(story_id)
+        if not story:
+            return jsonify({'error': 'Story not found'}), 404
+        
+        existing = StoryView.query.filter_by(story_id=story_id, user_id=session['user_id']).first()
+        if not existing:
+            view = StoryView(story_id=story_id, user_id=session['user_id'])
+            db.session.add(view)
+            story.view_count += 1
+            db.session.commit()
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================
+# FILE UPLOAD ROUTES
+# ============================================================
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+@app.route('/api/upload', methods=['POST'])
+@login_required
+def upload_file():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'File type not allowed'}), 400
+        
+        filename = secure_filename(file.filename)
+        unique_filename = f"{uuid.uuid4().hex}_{filename}"
+        
+        # Determine upload folder
+        folder = app.config['UPLOAD_FOLDER']
+        if file.content_type and file.content_type.startswith('image/'):
+            folder = app.config['MEDIA_FOLDER']
+        
+        file_path = os.path.join(folder, unique_filename)
+        file.save(file_path)
+        
+        file_url = f"/static/{folder.split('/')[-1]}/{unique_filename}"
+        file_size = os.path.getsize(file_path)
+        
+        return jsonify({
+            'success': True,
+            'file_url': file_url,
+            'file_name': filename,
+            'file_size': file_size,
+            'file_type': file.content_type
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/upload/avatar', methods=['POST'])
+@login_required
+def upload_avatar():
+    try:
+        if 'avatar' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['avatar']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'File type not allowed'}), 400
+        
+        filename = secure_filename(file.filename)
+        unique_filename = f"{uuid.uuid4().hex}_{filename}"
+        file_path = os.path.join(app.config['AVATAR_FOLDER'], unique_filename)
+        file.save(file_path)
+        
+        user = User.query.get(session['user_id'])
+        user.avatar = f"/static/avatars/{unique_filename}"
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'avatar_url': user.avatar
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ============================================================
 # ADMIN API ROUTES
 # ============================================================
 
-@app.route('/api/block-self', methods=['POST'])
-def block_self():
-    """API to block your own IP (for testing)"""
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if client_ip:
-        client_ip = client_ip.split(',')[0].strip()
-    
-    ip_manager.block_ip(client_ip, "Self-block test")
-    return jsonify({'success': True, 'ip': client_ip})
+@app.route('/api/admin/users', methods=['GET'])
+@admin_required
+def admin_users():
+    users = User.query.all()
+    return jsonify({'users': [u.to_dict() for u in users]})
 
-@app.route('/api/unblock', methods=['POST'])
+@app.route('/api/admin/users/<int:user_id>/ban', methods=['POST'])
+@admin_required
+def ban_user(user_id):
+    try:
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        if user.is_admin:
+            return jsonify({'error': 'Cannot ban admin'}), 400
+        
+        user.is_active = False
+        db.session.commit()
+        
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/ip/block', methods=['POST'])
+@admin_required
+def block_ip():
+    try:
+        data = request.json
+        ip = data.get('ip')
+        reason = data.get('reason', 'Admin action')
+        
+        if not ip:
+            return jsonify({'error': 'IP required'}), 400
+        
+        ip_manager.block_ip(ip, reason)
+        return jsonify({'success': True})
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/ip/unblock', methods=['POST'])
+@admin_required
 def unblock_ip():
-    """API to unblock an IP"""
-    data = request.json
-    ip = data.get('ip')
+    try:
+        data = request.json
+        ip = data.get('ip')
+        
+        if not ip:
+            return jsonify({'error': 'IP required'}), 400
+        
+        if ip_manager.unblock_ip(ip):
+            return jsonify({'success': True})
+        return jsonify({'error': 'IP not found'}), 404
     
-    if not ip:
-        return jsonify({'success': False, 'error': 'IP required'}), 400
-    
-    if ip_manager.unblock_ip(ip):
-        return jsonify({'success': True, 'ip': ip})
-    
-    return jsonify({'success': False, 'error': 'IP not found'}), 404
-
-@app.route('/api/clear-blocks', methods=['POST'])
-def clear_blocks():
-    """API to clear all blocked IPs"""
-    count = len(ip_manager.blocked_ips)
-    ip_manager.blocked_ips.clear()
-    return jsonify({'success': True, 'count': count})
-
-@app.route('/api/blocked-ips', methods=['GET'])
-def get_blocked_ips():
-    """API to get all blocked IPs"""
-    return jsonify({'blocked': ip_manager.get_blocked_info()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ============================================================
-# MAIN
+# WEBSOCKET EVENTS
+# ============================================================
+
+@socketio.on('connect')
+def handle_connect():
+    if 'user_id' in session:
+        user = User.query.get(session['user_id'])
+        if user:
+            user.is_online = True
+            db.session.commit()
+            emit('user_online', {'user_id': user.id, 'username': user.username}, broadcast=True)
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    if 'user_id' in session:
+        user = User.query.get(session['user_id'])
+        if user:
+            user.is_online = False
+            user.last_seen = datetime.utcnow()
+            db.session.commit()
+            emit('user_offline', {'user_id': user.id}, broadcast=True)
+
+@socketio.on('join')
+def handle_join(data):
+    room = data.get('room')
+    if room:
+        join_room(str(room))
+        emit('joined', {'room': room}, room=str(room))
+
+@socketio.on('leave')
+def handle_leave(data):
+    room = data.get('room')
+    if room:
+        leave_room(str(room))
+        emit('left', {'room': room}, room=str(room))
+
+@socketio.on('typing')
+def handle_typing(data):
+    room = data.get('room')
+    is_typing = data.get('is_typing', True)
+    user_id = session.get('user_id')
+    
+    if room and user_id:
+        emit('user_typing', {
+            'user_id': user_id,
+            'is_typing': is_typing
+        }, room=str(room))
+
+@socketio.on('voice_call')
+def handle_voice_call(data):
+    room = data.get('room')
+    action = data.get('action')  # start, end, accept, reject
+    
+    if room:
+        emit('voice_call_event', {
+            'action': action,
+            'caller_id': session.get('user_id'),
+            'caller_name': User.query.get(session['user_id']).display_name
+        }, room=str(room))
+
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
+# ============================================================
+# STATIC FILES
+# ============================================================
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_from_directory('static', filename)
+
+# ============================================================
+# COMPLETE HTML PAGES - A TO Z
+# ============================================================
+
+LOGIN_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dx Messenger - Login</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: #111;
+            padding: 50px 40px;
+            border-radius: 24px;
+            border: 1px solid #2a2a2a;
+            max-width: 420px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        }
+        .logo { 
+            text-align: center;
+            font-size: 2.8rem;
+            font-weight: 800;
+            color: #ffd700;
+            margin-bottom: 5px;
+        }
+        .logo span { color: #ff3b3b; }
+        .subtitle {
+            text-align: center;
+            color: #888;
+            font-size: 0.9rem;
+            margin-bottom: 30px;
+        }
+        .status {
+            background: #1a1a1a;
+            padding: 12px;
+            border-radius: 12px;
+            text-align: center;
+            margin-bottom: 25px;
+            border-left: 4px solid #4caf50;
+            color: #4caf50;
+            font-size: 0.9rem;
+        }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 25px;
+        }
+        .tab-btn {
+            flex: 1;
+            padding: 12px;
+            background: #1a1a1a;
+            border: none;
+            border-radius: 12px;
+            color: #888;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 0.95rem;
+        }
+        .tab-btn.active {
+            background: #ffd700;
+            color: #0a0a0a;
+        }
+        .tab { display: none; }
+        .tab.active { display: block; }
+        input {
+            width: 100%;
+            padding: 14px 16px;
+            margin: 8px 0;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+            color: #fff;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #ffd700;
+        }
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border-radius: 50px;
+            border: none;
+            font-weight: 700;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #ffd700;
+            color: #0a0a0a;
+            margin-top: 10px;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(255,215,0,0.2);
+        }
+        .error {
+            color: #ff3b3b;
+            font-size: 0.9rem;
+            margin: 8px 0;
+            display: none;
+        }
+        .success {
+            color: #4caf50;
+            font-size: 0.9rem;
+            margin: 8px 0;
+            display: none;
+        }
+        .links {
+            text-align: center;
+            margin-top: 15px;
+            font-size: 0.85rem;
+        }
+        .links a {
+            color: #ffd700;
+            cursor: pointer;
+            text-decoration: none;
+        }
+        .links a:hover { text-decoration: underline; }
+        .powered {
+            text-align: center;
+            margin-top: 25px;
+            padding-top: 20px;
+            border-top: 1px solid #1a1a1a;
+            color: #444;
+            font-size: 0.75rem;
+        }
+        .powered strong { color: #ffd700; }
+        @media (max-width: 480px) {
+            .container { padding: 30px 20px; }
+            .logo { font-size: 2.2rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">⚡Dx<span>Messenger</span></div>
+        <p class="subtitle">245-bit Encrypted • Real-time • Secure</p>
+        
+        <div class="status">✅ Server Online</div>
+        
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('login')">Login</button>
+            <button class="tab-btn" onclick="switchTab('register')">Sign Up</button>
+        </div>
+
+        <div id="loginTab" class="tab active">
+            <input type="text" id="loginUsername" placeholder="Username or Email" autocomplete="username">
+            <input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password">
+            <div id="loginError" class="error"></div>
+            <button class="btn" onclick="login()">Login</button>
+            <div class="links">
+                <a onclick="switchTab('register')">Create Account</a>
+            </div>
+        </div>
+
+        <div id="registerTab" class="tab">
+            <input type="text" id="regUsername" placeholder="Username" autocomplete="username">
+            <input type="email" id="regEmail" placeholder="Email" autocomplete="email">
+            <input type="password" id="regPassword" placeholder="Password (min 8 chars)" autocomplete="new-password">
+            <div id="regError" class="error"></div>
+            <div id="regSuccess" class="success"></div>
+            <button class="btn" onclick="register()">Create Account</button>
+            <div class="links">
+                <a onclick="switchTab('login')">Already have an account?</a>
+            </div>
+        </div>
+
+        <div class="powered">
+            Powered By <strong>⚡ Dx Builder</strong>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            document.getElementById(tab + 'Tab').classList.add('active');
+            event.target.classList.add('active');
+            document.getElementById('loginError').style.display = 'none';
+            document.getElementById('regError').style.display = 'none';
+            document.getElementById('regSuccess').style.display = 'none';
+        }
+
+        async function login() {
+            const username = document.getElementById('loginUsername').value;
+            const password = document.getElementById('loginPassword').value;
+            const errorEl = document.getElementById('loginError');
+
+            if (!username || !password) {
+                errorEl.textContent = 'Please fill in all fields';
+                errorEl.style.display = 'block';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    window.location.href = data.redirect || '/chat';
+                } else {
+                    errorEl.textContent = data.error || 'Login failed';
+                    errorEl.style.display = 'block';
+                }
+            } catch (e) {
+                errorEl.textContent = 'Network error. Please try again.';
+                errorEl.style.display = 'block';
+            }
+        }
+
+        async function register() {
+            const username = document.getElementById('regUsername').value;
+            const email = document.getElementById('regEmail').value;
+            const password = document.getElementById('regPassword').value;
+            const errorEl = document.getElementById('regError');
+            const successEl = document.getElementById('regSuccess');
+
+            if (!username || !email || !password) {
+                errorEl.textContent = 'Please fill in all fields';
+                errorEl.style.display = 'block';
+                return;
+            }
+
+            if (password.length < 8) {
+                errorEl.textContent = 'Password must be at least 8 characters';
+                errorEl.style.display = 'block';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, email, password })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    successEl.textContent = '✅ Account created! Please login.';
+                    successEl.style.display = 'block';
+                    errorEl.style.display = 'none';
+                    document.getElementById('regUsername').value = '';
+                    document.getElementById('regEmail').value = '';
+                    document.getElementById('regPassword').value = '';
+                    setTimeout(() => switchTab('login'), 1500);
+                } else {
+                    errorEl.textContent = data.error || 'Registration failed';
+                    errorEl.style.display = 'block';
+                }
+            } catch (e) {
+                errorEl.textContent = 'Network error. Please try again.';
+                errorEl.style.display = 'block';
+            }
+        }
+
+        document.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                if (document.getElementById('loginTab').classList.contains('active')) {
+                    login();
+                } else {
+                    register();
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+CHAT_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dx Messenger - Chat</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #fff;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .app {
+            display: flex;
+            height: 100vh;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        /* Sidebar */
+        .sidebar {
+            width: 300px;
+            background: #111;
+            border-right: 1px solid #2a2a2a;
+            display: flex;
+            flex-direction: column;
+        }
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid #2a2a2a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .sidebar-header .logo {
+            color: #ffd700;
+            font-weight: 800;
+            font-size: 1.2rem;
+        }
+        .sidebar-header .logo span { color: #ff3b3b; }
+        .sidebar-user {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 20px;
+            background: #1a1a1a;
+            border-bottom: 1px solid #2a2a2a;
+        }
+        .sidebar-user .avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #2a2a2a;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            color: #ffd700;
+            border: 2px solid #ffd700;
+        }
+        .sidebar-user .name {
+            flex: 1;
+            font-weight: 600;
+        }
+        .sidebar-user .status {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #4caf50;
+        }
+        .search-box {
+            padding: 12px 20px;
+        }
+        .search-box input {
+            width: 100%;
+            padding: 10px 16px;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 50px;
+            color: #fff;
+            font-size: 0.9rem;
+        }
+        .search-box input:focus { outline: none; border-color: #ffd700; }
+        .chat-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px 0;
+        }
+        .chat-item {
+            display: flex;
+            align-items: center;
+            padding: 12px 20px;
+            cursor: pointer;
+            transition: background 0.2s;
+            gap: 12px;
+        }
+        .chat-item:hover { background: #1a1a1a; }
+        .chat-item.active { background: #1a1a1a; border-left: 3px solid #ffd700; }
+        .chat-item .avatar {
+            width: 45px;
+            height: 45px;
+            border-radius: 50%;
+            background: #2a2a2a;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.1rem;
+            color: #ffd700;
+            flex-shrink: 0;
+        }
+        .chat-item .info { flex: 1; min-width: 0; }
+        .chat-item .info .name { font-weight: 500; font-size: 0.95rem; }
+        .chat-item .info .last-msg {
+            color: #888;
+            font-size: 0.8rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .chat-item .time { font-size: 0.7rem; color: #555; }
+        /* Main Chat */
+        .main-chat {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #0f0f0f;
+        }
+        .chat-header {
+            padding: 16px 24px;
+            border-bottom: 1px solid #2a2a2a;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: #111;
+        }
+        .chat-header .avatar {
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            background: #2a2a2a;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #ffd700;
+        }
+        .chat-header .name { font-weight: 600; font-size: 1.1rem; }
+        .chat-header .status { font-size: 0.75rem; color: #4caf50; }
+        .chat-header .actions { margin-left: auto; display: flex; gap: 15px; }
+        .chat-header .actions i { color: #888; cursor: pointer; font-size: 1.2rem; }
+        .chat-header .actions i:hover { color: #ffd700; }
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .msg {
+            max-width: 70%;
+            padding: 10px 16px;
+            border-radius: 16px;
+            font-size: 0.95rem;
+            line-height: 1.4;
+            word-wrap: break-word;
+        }
+        .msg.sent {
+            align-self: flex-end;
+            background: #ffd700;
+            color: #0a0a0a;
+            border-bottom-right-radius: 4px;
+        }
+        .msg.received {
+            align-self: flex-start;
+            background: #1a1a1a;
+            color: #fff;
+            border-bottom-left-radius: 4px;
+        }
+        .msg .time {
+            font-size: 0.65rem;
+            opacity: 0.6;
+            margin-top: 4px;
+            text-align: right;
+        }
+        .msg-input {
+            padding: 16px 24px;
+            border-top: 1px solid #2a2a2a;
+            display: flex;
+            gap: 12px;
+            background: #111;
+        }
+        .msg-input input {
+            flex: 1;
+            padding: 12px 20px;
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 50px;
+            color: #fff;
+            font-size: 0.95rem;
+        }
+        .msg-input input:focus { outline: none; border-color: #ffd700; }
+        .msg-input button {
+            padding: 12px 28px;
+            border-radius: 50px;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            background: #ffd700;
+            color: #0a0a0a;
+            transition: all 0.3s;
+        }
+        .msg-input button:hover { transform: scale(1.02); }
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #444;
+        }
+        .empty-state .icon { font-size: 4rem; margin-bottom: 15px; }
+        .empty-state h3 { color: #666; }
+        .empty-state p { color: #555; font-size: 0.9rem; }
+        .logout-btn {
+            background: #ff3b3b;
+            color: #fff;
+            border: none;
+            padding: 6px 16px;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.8rem;
+        }
+        .logout-btn:hover { opacity: 0.8; }
+        @media (max-width: 768px) {
+            .sidebar { width: 240px; }
+        }
+        @media (max-width: 600px) {
+            .sidebar { width: 100%; max-height: 200px; border-right: none; border-bottom: 1px solid #2a2a2a; }
+            .app { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">⚡Dx<span>M</span></div>
+                <button class="logout-btn" onclick="logout()">Logout</button>
+            </div>
+            <div class="sidebar-user">
+                <div class="avatar">👤</div>
+                <div class="name">{{ user.display_name or user.username }}</div>
+                <div class="status"></div>
+            </div>
+            <div class="search-box">
+                <input type="text" placeholder="Search users..." id="searchInput" oninput="searchUsers()">
+            </div>
+            <div class="chat-list" id="chatList">
+                {% for u in users %}
+                <div class="chat-item" onclick="openChat('user', {{ u.id }})" data-id="{{ u.id }}">
+                    <div class="avatar">👤</div>
+                    <div class="info">
+                        <div class="name">{{ u.display_name or u.username }}</div>
+                        <div class="last-msg">{% if u.is_online %}🟢 Online{% else %}Last seen recently{% endif %}</div>
+                    </div>
+                    <div class="time"></div>
+                </div>
+                {% endfor %}
+                {% for g in groups %}
+                <div class="chat-item" onclick="openChat('group', {{ g.id }})" data-id="{{ g.id }}">
+                    <div class="avatar">👥</div>
+                    <div class="info">
+                        <div class="name">📢 {{ g.name }}</div>
+                        <div class="last-msg">{{ g.member_count }} members</div>
+                    </div>
+                </div>
+                {% endfor %}
+                {% for c in channels %}
+                <div class="chat-item" onclick="openChat('channel', {{ c.id }})" data-id="{{ c.id }}">
+                    <div class="avatar">📡</div>
+                    <div class="info">
+                        <div class="name">📢 {{ c.name }}</div>
+                        <div class="last-msg">{{ c.subscriber_count }} subscribers</div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- Main Chat -->
+        <div class="main-chat">
+            <div class="chat-header">
+                <div class="avatar">💬</div>
+                <div>
+                    <div class="name" id="chatName">Select a chat</div>
+                    <div class="status" id="chatStatus">Click a user to start messaging</div>
+                </div>
+                <div class="actions">
+                    <span style="cursor:pointer;" onclick="alert('Voice call coming soon!')">📞</span>
+                    <span style="cursor:pointer;" onclick="alert('Video call coming soon!')">📹</span>
+                    <span style="cursor:pointer;" onclick="alert('Group info')">ℹ️</span>
+                </div>
+            </div>
+            <div class="messages" id="messages">
+                <div class="empty-state">
+                    <div class="icon">💬</div>
+                    <h3>No messages yet</h3>
+                    <p>Select a chat to start messaging</p>
+                </div>
+            </div>
+            <div class="msg-input">
+                <input type="text" id="messageInput" placeholder="Type a message..." onkeypress="if(event.key==='Enter') sendMessage()">
+                <button onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let currentChatType = null;
+        let currentChatId = null;
+        let username = "{{ user.username }}";
+
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+
+        socket.on('new_message', (data) => {
+            if (currentChatId && (data.chat_id == currentChatId || data.message.sender_id == currentChatId)) {
+                addMessage(data.message);
+            }
+        });
+
+        socket.on('user_online', (data) => {
+            document.querySelectorAll('.chat-item').forEach(el => {
+                if (el.dataset.id == data.user_id) {
+                    const lastMsg = el.querySelector('.last-msg');
+                    if (lastMsg) lastMsg.textContent = '🟢 Online';
+                }
+            });
+        });
+
+        socket.on('user_offline', (data) => {
+            document.querySelectorAll('.chat-item').forEach(el => {
+                if (el.dataset.id == data.user_id) {
+                    const lastMsg = el.querySelector('.last-msg');
+                    if (lastMsg) lastMsg.textContent = 'Offline';
+                }
+            });
+        });
+
+        async function openChat(type, id) {
+            currentChatType = type;
+            currentChatId = id;
+
+            document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.chat-item').forEach(el => {
+                if (el.dataset.id == id) el.classList.add('active');
+            });
+
+            const nameMap = {
+                {% for u in users %}
+                "user_{{ u.id }}": "{{ u.display_name or u.username }}",
+                {% endfor %}
+                {% for g in groups %}
+                "group_{{ g.id }}": "{{ g.name }}",
+                {% endfor %}
+                {% for c in channels %}
+                "channel_{{ c.id }}": "{{ c.name }}",
+                {% endfor %}
+            };
+            document.getElementById('chatName').textContent = nameMap[type + '_' + id] || 'Chat';
+            document.getElementById('chatStatus').textContent = 'Online';
+
+            // Join room
+            socket.emit('join', { room: id });
+
+            // Load messages
+            try {
+                const res = await fetch(`/api/messages?${type}_id=${id}&limit=50`);
+                const data = await res.json();
+                const messagesDiv = document.getElementById('messages');
+                messagesDiv.innerHTML = '';
+                if (data.messages && data.messages.length > 0) {
+                    data.messages.forEach(msg => addMessage(msg));
+                } else {
+                    messagesDiv.innerHTML = `
+                        <div class="empty-state">
+                            <div class="icon">💬</div>
+                            <h3>No messages</h3>
+                            <p>Send the first message!</p>
+                        </div>
+                    `;
+                }
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            } catch (e) {
+                console.error('Error loading messages:', e);
+            }
+        }
+
+        function addMessage(msg) {
+            const messagesDiv = document.getElementById('messages');
+            const emptyState = messagesDiv.querySelector('.empty-state');
+            if (emptyState) emptyState.remove();
+
+            const div = document.createElement('div');
+            const isSent = msg.sender_id == {{ user.id }};
+            div.className = 'msg ' + (isSent ? 'sent' : 'received');
+            div.innerHTML = `
+                ${msg.content || '📎 ' + (msg.file_name || 'Media')}
+                <div class="time">${new Date(msg.created_at).toLocaleTimeString()}</div>
+            `;
+            messagesDiv.appendChild(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const content = input.value.trim();
+            if (!content || !currentChatId) return;
+
+            const data = {
+                content: content,
+                message_type: 'text'
+            };
+            if (currentChatType === 'user') data.receiver_id = currentChatId;
+            else if (currentChatType === 'group') data.group_id = currentChatId;
+            else if (currentChatType === 'channel') data.channel_id = currentChatId;
+
+            try {
+                const res = await fetch('/api/messages/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                if (result.success) {
+                    addMessage(result.message);
+                    input.value = '';
+                } else {
+                    alert('Error: ' + result.error);
+                }
+            } catch (e) {
+                alert('Network error');
+            }
+        }
+
+        function searchUsers() {
+            const query = document.getElementById('searchInput').value.toLowerCase();
+            document.querySelectorAll('.chat-item').forEach(el => {
+                const name = el.querySelector('.name')?.textContent?.toLowerCase() || '';
+                el.style.display = name.includes(query) ? 'flex' : 'none';
+            });
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+                window.location.href = '/';
+            } catch (e) {
+                window.location.href = '/';
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+ADMIN_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Panel - Dx Messenger</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #fff;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid #2a2a2a;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        .logo { color: #ffd700; font-size: 2rem; font-weight: 800; }
+        .logo span { color: #ff3b3b; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: #111;
+            padding: 20px;
+            border-radius: 16px;
+            border: 1px solid #2a2a2a;
+            text-align: center;
+        }
+        .stat-card .number { font-size: 2.5rem; font-weight: 700; color: #ffd700; }
+        .stat-card .label { color: #888; font-size: 0.85rem; margin-top: 5px; }
+        .card {
+            background: #111;
+            border-radius: 16px;
+            border: 1px solid #2a2a2a;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .card h2 {
+            color: #ffd700;
+            font-size: 1.2rem;
+            margin-bottom: 15px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #1a1a1a;
+        }
+        th { color: #ffd700; font-weight: 600; }
+        td { color: #ccc; }
+        .badge {
+            padding: 4px 12px;
+            border-radius: 50px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .badge-success { background: #4caf50; color: #fff; }
+        .badge-danger { background: #ff3b3b; color: #fff; }
+        .badge-warning { background: #ffd700; color: #0a0a0a; }
+        .btn {
+            padding: 6px 16px;
+            border-radius: 50px;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.8rem;
+            transition: all 0.3s;
+        }
+        .btn-danger { background: #ff3b3b; color: #fff; }
+        .btn-success { background: #4caf50; color: #fff; }
+        .btn-primary { background: #ffd700; color: #0a0a0a; }
+        .btn:hover { opacity: 0.8; transform: translateY(-1px); }
+        .back { color: #ffd700; text-decoration: none; }
+        .back:hover { text-decoration: underline; }
+        .ip-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .ip-item {
+            background: #1a1a1a;
+            padding: 8px 16px;
+            border-radius: 50px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            border: 1px solid #2a2a2a;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .ip-item .reason { color: #888; font-size: 0.75rem; }
+        .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+        @media (max-width: 600px) {
+            table { font-size: 0.8rem; }
+            th, td { padding: 8px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">⚡Dx<span>Admin</span></div>
+            <div>
+                <a href="/chat" class="back">← Back to Chat</a>
+                <button class="btn btn-danger" onclick="logout()" style="margin-left:10px;">Logout</button>
+            </div>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="number">{{ users|length }}</div>
+                <div class="label">Total Users</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">{{ messages|length }}</div>
+                <div class="label">Total Messages</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">{{ groups|length }}</div>
+                <div class="label">Total Groups</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">{{ blocked_ips|length }}</div>
+                <div class="label">Blocked IPs</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📊 Users</h2>
+            <table>
+                <tr>
+                    <th>ID</th>
+                    <th>Username</th>
+                    <th>Email</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+                {% for u in users %}
+                <tr>
+                    <td>{{ u.id }}</td>
+                    <td>{{ u.username }}</td>
+                    <td>{{ u.email }}</td>
+                    <td>
+                        {% if u.is_online %}
+                        <span class="badge badge-success">Online</span>
+                        {% else %}
+                        <span class="badge badge-warning">Offline</span>
+                        {% endif %}
+                        {% if u.is_admin %}
+                        <span class="badge badge-success">Admin</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if not u.is_admin %}
+                        <button class="btn btn-danger" onclick="banUser({{ u.id }})">Ban</button>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>🚫 Blocked IPs</h2>
+            <div class="ip-list">
+                {% for ip, info in blocked_ips.items() %}
+                <div class="ip-item">
+                    {{ ip }}
+                    <span class="reason">{{ info.reason }}</span>
+                    <button class="btn btn-success" onclick="unblockIP('{{ ip }}')">Unblock</button>
+                </div>
+                {% else %}
+                <p style="color:#444;">No IPs currently blocked</p>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>⚡ Quick Actions</h2>
+            <div class="actions">
+                <button class="btn btn-danger" onclick="clearAllBlocks()">Clear All Blocks</button>
+                <button class="btn btn-primary" onclick="location.reload()">Refresh</button>
+            </div>
+        </div>
+
+        <div style="text-align:center;color:#444;font-size:0.8rem;margin-top:30px;">
+            Powered By <strong style="color:#ffd700;">⚡ Dx Builder</strong>
+        </div>
+    </div>
+
+    <script>
+        async function banUser(userId) {
+            if (!confirm('Ban this user?')) return;
+            try {
+                const res = await fetch(`/api/admin/users/${userId}/ban`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    alert('User banned!');
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (e) {
+                alert('Network error');
+            }
+        }
+
+        async function unblockIP(ip) {
+            if (!confirm('Unblock IP: ' + ip + '?')) return;
+            try {
+                const res = await fetch('/api/admin/ip/unblock', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert('IP unblocked!');
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (e) {
+                alert('Network error');
+            }
+        }
+
+        async function clearAllBlocks() {
+            if (!confirm('Clear ALL blocked IPs?')) return;
+            try {
+                const res = await fetch('/api/admin/ip/clear', { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    alert('All blocks cleared!');
+                    location.reload();
+                }
+            } catch (e) {
+                alert('Network error');
+            }
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+                window.location.href = '/';
+            } catch (e) {
+                window.location.href = '/';
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+# ============================================================
+# MAIN - START APPLICATION
 # ============================================================
 
 if __name__ == '__main__':
-    # Create database
     with app.app_context():
         db.create_all()
         print("✅ Database initialized!")
+        print("✅ Dx Messenger is ready!")
     
-    print("""
-    ╔══════════════════════════════════════════╗
-    ║  ⚡ Dx Messenger - All-in-One           ║
-    ║  🛡️ IP Block Page with Timer             ║
-    ║  🔓 Auto-unblock after timeout           ║
-    ║  📱 Full Messaging App                   ║
-    ║  ⚡ Powered by Dx Builder                ║
-    ╚══════════════════════════════════════════╝
-    """)
-    
-    print(f"🚀 Server running at http://localhost:5000")
-    print(f"📱 Admin Panel: http://localhost:5000/admin")
-    print(f"🛡️  Block Page: http://localhost:5000/blocked")
-    print(f"\n📝 Test IP blocking:")
-    print(f"   - Go to http://localhost:5000/admin")
-    print(f"   - Click 'Block Myself' on home page")
-    print(f"   - Or use: /api/block-self")
-    
-    # Run the app
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    socketio.run(app, host='0.0.0.0', port=port, debug=False)
